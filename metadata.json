@@ -1,0 +1,6 @@
+{
+  "name": "Paper Atlas",
+  "description": "Citation intelligence dashboard visualizing academic citation graphs with polar layouts and LOD canvas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
