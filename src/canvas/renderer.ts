@@ -1,15 +1,23 @@
 /**
  * Pure 2D Canvas Renderer for Paper Atlas.
  * Architectural purity: Zero React dependencies, zero store access, zero setState calls.
- * Designed for pure functional portability (e.g. drop-in replacement with WebGL in future).
+ * Supports reusable `RenderScratch` buffers for zero-allocation 60 FPS rendering,
+ * compound path batching for edges/particles, and zero per-node save/restore overhead.
  */
-import type { Graph, GNode, GEdge, Subfield } from '../data/schema.ts';
+import type { Graph, GNode, Subfield } from '../data/schema.ts';
 import type { CameraState } from './camera.ts';
 import { computeLod } from './lod.ts';
+import type { SubfieldBasePolar } from '../layout/precompute.ts';
+import {
+  computeClusterAnchors,
+  computeNodePositions,
+  type ClusterAnchor,
+  type WorldPoint,
+} from '../layout/positions.ts';
 
 export interface RenderState {
   graph: Graph;
-  subfieldPositions: Map<string, { x: number; y: number; angle: number; radius: number }>;
+  subfieldPositions: ReadonlyMap<string, SubfieldBasePolar>;
   orbitRadii: [number, number, number];
   selectedSubfieldId: string | null;
   hoveredSubfieldId: string | null;
@@ -31,7 +39,76 @@ export interface RenderMetrics {
   renderTimeMs: number;
 }
 
-// Color palette constants
+export interface NodeRenderEntry {
+  x: number;
+  y: number;
+  size: number;
+  node: GNode;
+  isPastYear: boolean;
+  isSelectedCluster: boolean;
+  isHovered: boolean;
+  isSelected: boolean;
+}
+
+/**
+ * Reusable frame scratchpad passed from host ref so steady-state frames allocate
+ * zero Maps, Sets, or edge/particle coordinate objects.
+ */
+export interface RenderScratch {
+  clusterAnchors: Map<string, ClusterAnchor>;
+  nodePositions: Map<string, WorldPoint>;
+  nodeRenderMap: Map<string, NodeRenderEntry>;
+  subfieldById: Map<string, Subfield>;
+  cachedGraphRef: Graph | null;
+  selectedNodeNeighbors: Set<string>;
+  cachedSelectedNodeId: string | null;
+  // Flat numeric segment buffers: [sx, sy, cx, cy, tx, ty, ...]
+  directActiveSegs: number[];
+  directPastSegs: number[];
+  clusterActiveSegs: number[];
+  clusterPastSegs: number[];
+  bgActiveSegs: number[];
+  bgPastSegs: number[];
+  // Flat numeric particle coordinate buffers: [px, py, ...]
+  selectedParticles: number[];
+  ambientParticles: number[];
+  // Cached font strings keyed by camera.scale
+  cachedScale: number;
+  fontCluster: string;
+  fontNodeRegular: string;
+  fontNodeSelected: string;
+  fontNodeDetail: string;
+  fontRootTitle: string;
+  fontRootSub: string;
+}
+
+export function createRenderScratch(): RenderScratch {
+  return {
+    clusterAnchors: new Map(),
+    nodePositions: new Map(),
+    nodeRenderMap: new Map(),
+    subfieldById: new Map(),
+    cachedGraphRef: null,
+    selectedNodeNeighbors: new Set(),
+    cachedSelectedNodeId: '__uninitialized__',
+    directActiveSegs: [],
+    directPastSegs: [],
+    clusterActiveSegs: [],
+    clusterPastSegs: [],
+    bgActiveSegs: [],
+    bgPastSegs: [],
+    selectedParticles: [],
+    ambientParticles: [],
+    cachedScale: -1,
+    fontCluster: '',
+    fontNodeRegular: '',
+    fontNodeSelected: '',
+    fontNodeDetail: '',
+    fontRootTitle: '',
+    fontRootSub: '',
+  };
+}
+
 const PALETTE = {
   bgVoid: '#030607',
   bgDeep: '#0A1417',
@@ -49,15 +126,76 @@ const PALETTE = {
   rootNode: '#B98FE8',
 };
 
+const ORBIT_RING_STYLES = [
+  'rgba(255, 255, 255, 0.07)',
+  'rgba(255, 255, 255, 0.055)',
+  'rgba(255, 255, 255, 0.04)',
+] as const;
+
 function getNodeColor(kind: string): string {
   switch (kind) {
-    case 'paper': return PALETTE.kindPaper;
-    case 'review': return PALETTE.kindReview;
-    case 'author': return PALETTE.kindAuthor;
-    case 'venue': return PALETTE.kindVenue;
-    default: return PALETTE.kindPaper;
+    case 'paper':
+      return PALETTE.kindPaper;
+    case 'review':
+      return PALETTE.kindReview;
+    case 'author':
+      return PALETTE.kindAuthor;
+    case 'venue':
+      return PALETTE.kindVenue;
+    default:
+      return PALETTE.kindPaper;
   }
 }
+
+function strokeBezierBucket(
+  ctx: CanvasRenderingContext2D,
+  segs: readonly number[],
+  strokeStyle: string,
+  lineWidth: number
+): void {
+  if (segs.length === 0) return;
+  ctx.beginPath();
+  for (let i = 0; i < segs.length; i += 6) {
+    ctx.moveTo(segs[i], segs[i + 1]);
+    ctx.quadraticCurveTo(segs[i + 2], segs[i + 3], segs[i + 4], segs[i + 5]);
+  }
+  ctx.strokeStyle = strokeStyle;
+  ctx.lineWidth = lineWidth;
+  ctx.stroke();
+}
+
+function fillParticleBucket(
+  ctx: CanvasRenderingContext2D,
+  coords: readonly number[],
+  radius: number,
+  fillStyle: string
+): void {
+  if (coords.length === 0) return;
+  ctx.beginPath();
+  const twoPi = Math.PI * 2;
+  for (let i = 0; i < coords.length; i += 2) {
+    const px = coords[i];
+    const py = coords[i + 1];
+    ctx.moveTo(px + radius, py);
+    ctx.arc(px, py, radius, 0, twoPi);
+  }
+  ctx.fillStyle = fillStyle;
+  ctx.fill();
+}
+
+function updateCachedFonts(scratch: RenderScratch, scale: number): void {
+  if (scratch.cachedScale === scale) return;
+  scratch.cachedScale = scale;
+  scratch.fontCluster = `500 ${Math.max(9, 10 / scale)}px Inter, sans-serif`;
+  const nodeLabelPx = Math.max(8.5, 9 / scale);
+  scratch.fontNodeRegular = `400 ${nodeLabelPx}px Inter, sans-serif`;
+  scratch.fontNodeSelected = `500 ${nodeLabelPx}px Inter, sans-serif`;
+  scratch.fontNodeDetail = `400 ${Math.max(7.5, 8 / scale)}px Inter, sans-serif`;
+  scratch.fontRootTitle = `500 ${Math.max(10, 11 / scale)}px Inter, sans-serif`;
+  scratch.fontRootSub = `400 ${Math.max(8.5, 9 / scale)}px Inter, sans-serif`;
+}
+
+const fallbackScratch = createRenderScratch();
 
 /**
  * Main Pure Render Function
@@ -67,24 +205,38 @@ export function renderCanvas(
   state: RenderState,
   camera: CameraState,
   timeSec: number,
-  dims: RenderDimensions
+  dims: RenderDimensions,
+  scratch: RenderScratch = fallbackScratch
 ): RenderMetrics {
   const startTime = performance.now();
   const { width, height } = dims;
 
-  // Origin point according to prompt layout specs: (0.42W, 0.54H)
+  // Origin point according to layout specs: (0.42W, 0.54H)
   const originX = width * 0.42;
   const originY = height * 0.54;
+  const invScale = 1 / camera.scale;
 
   let nodesDrawn = 0;
   let edgesDrawn = 0;
 
+  updateCachedFonts(scratch, camera.scale);
+
+  if (scratch.cachedGraphRef !== state.graph) {
+    scratch.cachedGraphRef = state.graph;
+    scratch.subfieldById.clear();
+    for (let i = 0; i < state.graph.subfields.length; i++) {
+      const sf = state.graph.subfields[i];
+      scratch.subfieldById.set(sf.id, sf);
+    }
+    scratch.cachedSelectedNodeId = '__uninitialized__';
+  }
+
   // 1. Clear background completely across entire physical canvas buffer
-  ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur = 0;
   ctx.fillStyle = PALETTE.bgVoid;
   ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-  ctx.restore();
 
   // 2. Set DPR transform once for uniform logical coordinate space
   ctx.save();
@@ -110,49 +262,33 @@ export function renderCanvas(
   ctx.translate(originX + camera.x, originY + camera.y);
   ctx.scale(camera.scale, camera.scale);
 
-  // Compute LOD state from zoom scale
   const lod = computeLod(camera.scale);
 
-  // Visible viewport bounding box in world coordinates (for frustum/viewport culling)
-  const viewMargin = 80 / camera.scale;
-  const worldMinX = (-originX - camera.x) / camera.scale - viewMargin;
-  const worldMaxX = (width - originX - camera.x) / camera.scale + viewMargin;
-  const worldMinY = (-originY - camera.y) / camera.scale - viewMargin;
-  const worldMaxY = (height - originY - camera.y) / camera.scale + viewMargin;
+  // Visible viewport bounding box in world coordinates (frustum culling)
+  const viewMargin = 80 * invScale;
+  const worldMinX = (-originX - camera.x) * invScale - viewMargin;
+  const worldMaxX = (width - originX - camera.x) * invScale + viewMargin;
+  const worldMinY = (-originY - camera.y) * invScale - viewMargin;
+  const worldMaxY = (height - originY - camera.y) * invScale + viewMargin;
 
-  // Compute animated cluster positions
-  // Amplitude 2.5px, phase = idx * 1.25 (never in sync)
-  const animatedClusterAnchors = new Map<string, { x: number; y: number; isSelected: boolean; isHovered: boolean }>();
-  state.graph.subfields.forEach((sf, idx) => {
-    const rawPos = state.subfieldPositions.get(sf.id) || { x: 0, y: 0, angle: 0, radius: 260 };
-    const isSelected = sf.id === state.selectedSubfieldId;
-    const isHovered = sf.id === state.hoveredSubfieldId;
+  // Compute animated cluster positions in-place via shared positions.ts
+  const animatedClusterAnchors = computeClusterAnchors(
+    state.graph.subfields,
+    state.subfieldPositions,
+    timeSec,
+    state.selectedSubfieldId,
+    state.hoveredSubfieldId,
+    scratch.clusterAnchors
+  );
 
-    // Center sine float: 2.5px amplitude, non-synchronous phase
-    const floatOffset = Math.sin(timeSec * 1.2 + idx * 1.25) * 2.5;
-    let effectiveRadius = rawPos.radius + floatOffset;
-
-    // Hover expands 6px; Selected expands 1.18x
-    if (isSelected) {
-      effectiveRadius *= 1.18;
-    } else if (isHovered) {
-      effectiveRadius += 6;
-    }
-
-    const ax = Math.cos(rawPos.angle) * effectiveRadius;
-    const ay = Math.sin(rawPos.angle) * effectiveRadius;
-    animatedClusterAnchors.set(sf.id, { x: ax, y: ay, isSelected, isHovered });
-  });
-
-  // 3. Draw Orbit Rings (1px, subtle alpha 0.07 / 0.055 / 0.04)
-  ctx.lineWidth = 1 / camera.scale;
-  const alphas = [0.07, 0.055, 0.04];
-  state.orbitRadii.forEach((r, idx) => {
+  // Draw Orbit Rings (1px, subtle alpha 0.07 / 0.055 / 0.04)
+  ctx.lineWidth = invScale;
+  for (let idx = 0; idx < state.orbitRadii.length; idx++) {
     ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
-    ctx.strokeStyle = `rgba(255, 255, 255, ${alphas[idx]})`;
+    ctx.arc(0, 0, state.orbitRadii[idx], 0, Math.PI * 2);
+    ctx.strokeStyle = ORBIT_RING_STYLES[idx] ?? ORBIT_RING_STYLES[2];
     ctx.stroke();
-  });
+  }
 
   // 4. Draw Radar Sweep line (0.9 rad/s, linear gradient fade)
   const radarSweepAngle = (timeSec * 0.9) % (Math.PI * 2);
@@ -174,266 +310,262 @@ export function renderCanvas(
   ctx.moveTo(0, 0);
   ctx.lineTo(radarMaxRadius, 0);
   ctx.strokeStyle = 'rgba(230, 210, 154, 0.28)';
-  ctx.lineWidth = 1 / camera.scale;
+  ctx.lineWidth = invScale;
   ctx.stroke();
   ctx.restore();
 
-  // 5. Pre-map positioned active nodes for drawing and edge lookup
-  const nodeRenderMap = new Map<string, {
-    x: number;
-    y: number;
-    size: number;
-    node: GNode;
-    isPastYear: boolean;
-    isSelectedCluster: boolean;
-    isHovered: boolean;
-    isSelected: boolean;
-  }>();
+  // 5. Compute animated node positions in-place and update reusable nodeRenderMap
+  const animatedNodePositions = computeNodePositions(
+    state.graph.nodes,
+    state.graph.root.id,
+    animatedClusterAnchors,
+    timeSec,
+    scratch.nodePositions
+  );
 
-  state.graph.nodes.forEach((node, k) => {
-    let nx = 0;
-    let ny = 0;
-
-    if (node.id === state.graph.root.id || node.subfieldId === 'root') {
-      nx = 0;
-      ny = 0;
-    } else {
-      const clusterAnchor = animatedClusterAnchors.get(node.subfieldId);
-      if (!clusterAnchor) return;
-
-      // Intra-cluster node orbital micro-wobble:
-      // angular velocity = 0.07 + k * 0.004, odd/even alternating
-      const direction = (k % 2 === 0) ? 1 : -1;
-      const wobbleSpeed = (0.07 + (k % 20) * 0.004) * direction;
-      const currentAngle = node.orbitAngle + timeSec * wobbleSpeed;
-
-      let r = node.orbitRadius;
-      if (clusterAnchor.isSelected) {
-        r *= 1.12; // Expansion within selected cluster
-      }
-
-      nx = clusterAnchor.x + Math.cos(currentAngle) * r;
-      ny = clusterAnchor.y + Math.sin(currentAngle) * r;
-    }
+  const nodeRenderMap = scratch.nodeRenderMap;
+  const graphNodes = state.graph.nodes;
+  for (let i = 0; i < graphNodes.length; i++) {
+    const node = graphNodes[i];
+    const pos = animatedNodePositions.get(node.id);
+    if (!pos) continue;
 
     const isPastYear = node.year > state.activeYear;
     const isSelectedCluster = node.subfieldId === state.selectedSubfieldId;
     const isHovered = node.id === state.hoveredNodeId;
     const isSelected = node.id === state.selectedNodeId;
 
-    nodeRenderMap.set(node.id, {
-      x: nx,
-      y: ny,
-      size: node.size,
-      node,
-      isPastYear,
-      isSelectedCluster,
-      isHovered,
-      isSelected,
-    });
-  });
-
-  // Precompute 1st-degree citation neighbors if a specific node is selected
-  const selectedNodeNeighbors = new Set<string>();
-  if (state.selectedNodeId) {
-    selectedNodeNeighbors.add(state.selectedNodeId);
-    state.graph.edges.forEach(edge => {
-      if (edge.source === state.selectedNodeId) selectedNodeNeighbors.add(edge.target);
-      if (edge.target === state.selectedNodeId) selectedNodeNeighbors.add(edge.source);
-    });
+    const existing = nodeRenderMap.get(node.id);
+    if (existing) {
+      existing.x = pos.x;
+      existing.y = pos.y;
+      existing.size = node.size;
+      existing.node = node;
+      existing.isPastYear = isPastYear;
+      existing.isSelectedCluster = isSelectedCluster;
+      existing.isHovered = isHovered;
+      existing.isSelected = isSelected;
+    } else {
+      nodeRenderMap.set(node.id, {
+        x: pos.x,
+        y: pos.y,
+        size: node.size,
+        node,
+        isPastYear,
+        isSelectedCluster,
+        isHovered,
+        isSelected,
+      });
+    }
   }
 
-  // 6. Draw Edges
-  // Clean citation highlighting:
-  // - Node selected: highlight ONLY its direct 1st-degree citation edges in gold, dim all others!
-  // - Subfield selected: highlight intra-cluster edges + root backbone, keep external cross-edges subtle.
-  // - None selected: render uniform subtle ambient edges.
-  const edgeParticles: Array<{ x: number; y: number; isSelected: boolean }> = [];
+  // Update 1st-degree citation neighbors only when selectedNodeId changes
+  const selectedNodeNeighbors = scratch.selectedNodeNeighbors;
+  if (scratch.cachedSelectedNodeId !== state.selectedNodeId) {
+    scratch.cachedSelectedNodeId = state.selectedNodeId;
+    selectedNodeNeighbors.clear();
+    if (state.selectedNodeId) {
+      selectedNodeNeighbors.add(state.selectedNodeId);
+      const edges = state.graph.edges;
+      for (let i = 0; i < edges.length; i++) {
+        const edge = edges[i];
+        if (edge.source === state.selectedNodeId) selectedNodeNeighbors.add(edge.target);
+        if (edge.target === state.selectedNodeId) selectedNodeNeighbors.add(edge.source);
+      }
+    }
+  }
 
-  state.graph.edges.forEach((edge, edgeIdx) => {
+  // 6. Batch Edges & Particles into flat reusable arrays (6 stroke passes instead of 3,600+)
+  const directActiveSegs = scratch.directActiveSegs;
+  const directPastSegs = scratch.directPastSegs;
+  const clusterActiveSegs = scratch.clusterActiveSegs;
+  const clusterPastSegs = scratch.clusterPastSegs;
+  const bgActiveSegs = scratch.bgActiveSegs;
+  const bgPastSegs = scratch.bgPastSegs;
+  const selectedParticles = scratch.selectedParticles;
+  const ambientParticles = scratch.ambientParticles;
+
+  directActiveSegs.length = 0;
+  directPastSegs.length = 0;
+  clusterActiveSegs.length = 0;
+  clusterPastSegs.length = 0;
+  bgActiveSegs.length = 0;
+  bgPastSegs.length = 0;
+  selectedParticles.length = 0;
+  ambientParticles.length = 0;
+
+  const hasFocus = Boolean(state.selectedNodeId || state.selectedSubfieldId);
+  const edges = state.graph.edges;
+
+  for (let edgeIdx = 0; edgeIdx < edges.length; edgeIdx++) {
+    const edge = edges[edgeIdx];
     const src = nodeRenderMap.get(edge.source);
     const tgt = nodeRenderMap.get(edge.target);
-    if (!src || !tgt) return;
+    if (!src || !tgt) continue;
 
-    // Viewport cull check
-    const minEx = Math.min(src.x, tgt.x);
-    const maxEx = Math.max(src.x, tgt.x);
-    const minEy = Math.min(src.y, tgt.y);
-    const maxEy = Math.max(src.y, tgt.y);
+    const minEx = src.x < tgt.x ? src.x : tgt.x;
+    const maxEx = src.x > tgt.x ? src.x : tgt.x;
+    const minEy = src.y < tgt.y ? src.y : tgt.y;
+    const maxEy = src.y > tgt.y ? src.y : tgt.y;
     if (maxEx < worldMinX || minEx > worldMaxX || maxEy < worldMinY || minEy > worldMaxY) {
-      return;
+      continue;
     }
 
-    const isDirectNodeEdge = state.selectedNodeId
-      ? (edge.source === state.selectedNodeId || edge.target === state.selectedNodeId)
-      : false;
+    const isDirectNodeEdge = state.selectedNodeId !== null &&
+      (edge.source === state.selectedNodeId || edge.target === state.selectedNodeId);
 
-    const isIntraClusterEdge = !state.selectedNodeId && state.selectedSubfieldId
-      ? (src.node.subfieldId === state.selectedSubfieldId && tgt.node.subfieldId === state.selectedSubfieldId)
-      : false;
+    const isIntraClusterEdge = !state.selectedNodeId && state.selectedSubfieldId !== null &&
+      src.node.subfieldId === state.selectedSubfieldId &&
+      tgt.node.subfieldId === state.selectedSubfieldId;
 
     const connectsRoot = src.node.subfieldId === 'root' || tgt.node.subfieldId === 'root';
-    const isRootBackboneEdge = !state.selectedNodeId && state.selectedSubfieldId && connectsRoot &&
+    const isRootBackboneEdge = !state.selectedNodeId && state.selectedSubfieldId !== null && connectsRoot &&
       (src.node.subfieldId === state.selectedSubfieldId || tgt.node.subfieldId === state.selectedSubfieldId);
 
     const isEdgeSelected = isDirectNodeEdge || isIntraClusterEdge || isRootBackboneEdge;
-    const isEdgePast = src.isPastYear || tgt.isPastYear;
-
-    // In LOD 1 (scale < 0.8), only render backbone edges to root or selected
     if (!lod.showNodes && !connectsRoot && !isEdgeSelected) {
-      return;
+      continue;
     }
 
-    // Secondary quadratic bezier curve
+    const isEdgePast = src.isPastYear || tgt.isPastYear;
+
     const mx = (src.x + tgt.x) * 0.5;
     const my = (src.y + tgt.y) * 0.5;
     const dx = tgt.x - src.x;
     const dy = tgt.y - src.y;
-    const dist = Math.hypot(dx, dy);
-
-    // Perpendicular normal vector
-    const perpX = -dy / (dist || 1);
-    const perpY = dx / (dist || 1);
-    const offsetMagnitude = dist * 0.22;
-    const cx = mx + perpX * offsetMagnitude;
-    const cy = my + perpY * offsetMagnitude;
-
-    ctx.beginPath();
-    ctx.moveTo(src.x, src.y);
-    ctx.quadraticCurveTo(cx, cy, tgt.x, tgt.y);
+    // Algebraic identity: (-dy / dist) * (0.22 * dist) === -dy * 0.22 (saves 3,600+ sqrt calls/frame)
+    const cx = mx - dy * 0.22;
+    const cy = my + dx * 0.22;
 
     if (isDirectNodeEdge) {
-      // Crisp focal gold highlight for direct citations
-      ctx.strokeStyle = isEdgePast ? 'rgba(230, 210, 154, 0.25)' : 'rgba(230, 210, 154, 0.85)';
-      ctx.lineWidth = 1.75 / camera.scale;
+      const targetArr = isEdgePast ? directPastSegs : directActiveSegs;
+      targetArr.push(src.x, src.y, cx, cy, tgt.x, tgt.y);
+      const pPhase = (timeSec * 0.3 + edgeIdx * 0.23) % 1.0;
+      const omt = 1 - pPhase;
+      selectedParticles.push(
+        omt * omt * src.x + 2 * omt * pPhase * cx + pPhase * pPhase * tgt.x,
+        omt * omt * src.y + 2 * omt * pPhase * cy + pPhase * pPhase * tgt.y
+      );
     } else if (isIntraClusterEdge || isRootBackboneEdge) {
-      // Subdued gold for intra-cluster connections
-      ctx.strokeStyle = isEdgePast ? 'rgba(230, 210, 154, 0.16)' : 'rgba(230, 210, 154, 0.40)';
-      ctx.lineWidth = 1.25 / camera.scale;
+      const targetArr = isEdgePast ? clusterPastSegs : clusterActiveSegs;
+      targetArr.push(src.x, src.y, cx, cy, tgt.x, tgt.y);
+      const pPhase = (timeSec * 0.21 + edgeIdx * 0.19) % 1.0;
+      const omt = 1 - pPhase;
+      selectedParticles.push(
+        omt * omt * src.x + 2 * omt * pPhase * cx + pPhase * pPhase * tgt.x,
+        omt * omt * src.y + 2 * omt * pPhase * cy + pPhase * pPhase * tgt.y
+      );
     } else {
-      // Dim background edges when focusing, avoiding spaghetti clutter
-      const bgAlpha = (state.selectedNodeId || state.selectedSubfieldId) ? 0.02 : 0.055;
-      ctx.strokeStyle = isEdgePast ? 'rgba(255, 255, 255, 0.015)' : `rgba(255, 255, 255, ${bgAlpha})`;
-      ctx.lineWidth = 0.75 / camera.scale;
+      const targetArr = isEdgePast ? bgPastSegs : bgActiveSegs;
+      targetArr.push(src.x, src.y, cx, cy, tgt.x, tgt.y);
+      if (!hasFocus && edgeIdx % 4 === 0) {
+        const pPhase = (timeSec * 0.12 + edgeIdx * 0.17) % 1.0;
+        const omt = 1 - pPhase;
+        ambientParticles.push(
+          omt * omt * src.x + 2 * omt * pPhase * cx + pPhase * pPhase * tgt.x,
+          omt * omt * src.y + 2 * omt * pPhase * cy + pPhase * pPhase * tgt.y
+        );
+      }
     }
-    ctx.stroke();
+
     edgesDrawn++;
+  }
 
-    // Animated particles
-    if (isDirectNodeEdge) {
-      const pPhase = ((timeSec * 60 * 0.005) + (edgeIdx * 0.23)) % 1.0;
-      const px = (1 - pPhase) * (1 - pPhase) * src.x + 2 * (1 - pPhase) * pPhase * cx + pPhase * pPhase * tgt.x;
-      const py = (1 - pPhase) * (1 - pPhase) * src.y + 2 * (1 - pPhase) * pPhase * cy + pPhase * pPhase * tgt.y;
-      edgeParticles.push({ x: px, y: py, isSelected: true });
-    } else if (isIntraClusterEdge || isRootBackboneEdge) {
-      const pPhase = ((timeSec * 60 * 0.0035) + (edgeIdx * 0.19)) % 1.0;
-      const px = (1 - pPhase) * (1 - pPhase) * src.x + 2 * (1 - pPhase) * pPhase * cx + pPhase * pPhase * tgt.x;
-      const py = (1 - pPhase) * (1 - pPhase) * src.y + 2 * (1 - pPhase) * pPhase * cy + pPhase * pPhase * tgt.y;
-      edgeParticles.push({ x: px, y: py, isSelected: true });
-    } else if (!state.selectedNodeId && !state.selectedSubfieldId && edgeIdx % 4 === 0) {
-      const pPhase = ((timeSec * 60 * 0.002) + (edgeIdx * 0.17)) % 1.0;
-      const px = (1 - pPhase) * (1 - pPhase) * src.x + 2 * (1 - pPhase) * pPhase * cx + pPhase * pPhase * tgt.x;
-      const py = (1 - pPhase) * (1 - pPhase) * src.y + 2 * (1 - pPhase) * pPhase * cy + pPhase * pPhase * tgt.y;
-      edgeParticles.push({ x: px, y: py, isSelected: false });
-    }
-  });
+  // Render batched edge buckets back-to-front so focal gold edges sit crisply on top
+  const bgActiveStyle = hasFocus ? 'rgba(255, 255, 255, 0.02)' : 'rgba(255, 255, 255, 0.055)';
+  strokeBezierBucket(ctx, bgPastSegs, 'rgba(255, 255, 255, 0.015)', 0.75 * invScale);
+  strokeBezierBucket(ctx, bgActiveSegs, bgActiveStyle, 0.75 * invScale);
+  strokeBezierBucket(ctx, clusterPastSegs, 'rgba(230, 210, 154, 0.16)', 1.25 * invScale);
+  strokeBezierBucket(ctx, clusterActiveSegs, 'rgba(230, 210, 154, 0.40)', 1.25 * invScale);
+  strokeBezierBucket(ctx, directPastSegs, 'rgba(230, 210, 154, 0.25)', 1.75 * invScale);
+  strokeBezierBucket(ctx, directActiveSegs, 'rgba(230, 210, 154, 0.85)', 1.75 * invScale);
 
-  // 7. Draw edge particles
-  edgeParticles.forEach(p => {
-    ctx.beginPath();
-    const particleRadius = (p.isSelected ? 1.8 : 1.2) / camera.scale;
-    ctx.arc(p.x, p.y, particleRadius, 0, Math.PI * 2);
-    ctx.fillStyle = p.isSelected ? PALETTE.accentHi : 'rgba(143, 182, 216, 0.45)';
-    ctx.fill();
-  });
+  // 7. Draw batched edge particles (2 fill calls total)
+  fillParticleBucket(ctx, ambientParticles, 1.2 * invScale, 'rgba(143, 182, 216, 0.45)');
+  fillParticleBucket(ctx, selectedParticles, 1.8 * invScale, PALETTE.accentHi);
 
   // 8. Draw Subfield Cluster Centers and Hull Rings
-  animatedClusterAnchors.forEach((anchor, sfId) => {
+  ctx.font = scratch.fontCluster;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const clusterFontSize = Math.max(9, 10 * invScale);
+
+  for (const [sfId, anchor] of animatedClusterAnchors.entries()) {
     const isSelected = anchor.isSelected;
     const isHovered = anchor.isHovered;
 
-    // Cluster outer halo ring
     ctx.beginPath();
-    const haloRadius = isSelected ? 48 : (isHovered ? 44 : 36);
+    const haloRadius = isSelected ? 48 : isHovered ? 44 : 36;
     ctx.arc(anchor.x, anchor.y, haloRadius, 0, Math.PI * 2);
     ctx.strokeStyle = isSelected
       ? 'rgba(230, 210, 154, 0.45)'
-      : (isHovered ? 'rgba(255, 255, 255, 0.22)' : 'rgba(255, 255, 255, 0.06)');
-    ctx.lineWidth = (isSelected ? 1.5 : 1) / camera.scale;
+      : isHovered
+        ? 'rgba(255, 255, 255, 0.22)'
+        : 'rgba(255, 255, 255, 0.06)';
+    ctx.lineWidth = (isSelected ? 1.5 : 1) * invScale;
     ctx.stroke();
 
-    // Cluster center core badge
     ctx.beginPath();
-    ctx.arc(anchor.x, anchor.y, 4 / camera.scale, 0, Math.PI * 2);
+    ctx.arc(anchor.x, anchor.y, 4 * invScale, 0, Math.PI * 2);
     ctx.fillStyle = isSelected ? PALETTE.accentHi : PALETTE.textDim;
     ctx.fill();
 
-    // Cluster title label with background pill for pristine legibility
-    const subfield = state.graph.subfields.find(s => s.id === sfId);
+    const subfield = scratch.subfieldById.get(sfId);
     if (subfield) {
-      const fontSize = Math.max(9, 10 / camera.scale);
-      ctx.font = `500 ${fontSize}px Inter, sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-
       const labelText = subfield.name;
-      const textMetrics = ctx.measureText(labelText);
-      const textWidth = textMetrics.width;
+      const textWidth = ctx.measureText(labelText).width;
       const labelY = anchor.y - (haloRadius + 10);
 
-      // Pill backdrop
       ctx.fillStyle = 'rgba(10, 20, 23, 0.88)';
       ctx.beginPath();
-      const padX = 6 / camera.scale;
-      const padY = 3 / camera.scale;
+      const padX = 6 * invScale;
+      const padY = 3 * invScale;
       ctx.roundRect(
         anchor.x - textWidth / 2 - padX,
-        labelY - fontSize / 2 - padY,
+        labelY - clusterFontSize / 2 - padY,
         textWidth + padX * 2,
-        fontSize + padY * 2,
-        4 / camera.scale
+        clusterFontSize + padY * 2,
+        4 * invScale
       );
       ctx.fill();
 
-      // Pill subtle border
       ctx.strokeStyle = isSelected ? 'rgba(230, 210, 154, 0.4)' : 'rgba(255, 255, 255, 0.1)';
-      ctx.lineWidth = 1 / camera.scale;
+      ctx.lineWidth = invScale;
       ctx.stroke();
 
-      // Text
-      ctx.fillStyle = isSelected ? PALETTE.accentHi : (isHovered ? PALETTE.textHi : PALETTE.text);
+      ctx.fillStyle = isSelected ? PALETTE.accentHi : isHovered ? PALETTE.textHi : PALETTE.text;
       ctx.fillText(labelText, anchor.x, labelY);
     }
-  });
+  }
 
-  // 9. Draw Nodes
-  // Separate into regular passes and glow pass to avoid unnecessary shadowBlur toggling
-  nodeRenderMap.forEach(item => {
-    const { x, y, size, node, isPastYear, isSelectedCluster, isHovered, isSelected } = item;
+  // 9. Draw Nodes (zero per-node ctx.save/restore; hoisted text alignment & cached fonts)
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  let currentFont = '';
+  const twoPi = Math.PI * 2;
+  const rootNodeId = state.graph.root.id;
 
-    // Viewport cull check
+  for (let i = 0; i < graphNodes.length; i++) {
+    const node = graphNodes[i];
+    if (node.id === rootNodeId || node.subfieldId === 'root') continue;
+
+    const item = nodeRenderMap.get(node.id);
+    if (!item) continue;
+
+    const { x, y, size, isPastYear, isSelectedCluster, isHovered } = item;
+
     if (x < worldMinX || x > worldMaxX || y < worldMinY || y > worldMaxY) {
-      return;
+      continue;
     }
 
-    // Skip root node here (handled in dedicated step with tick ring)
-    if (node.id === state.graph.root.id || node.subfieldId === 'root') {
-      return;
-    }
-
-    // LOD alpha check
     if (!lod.showNodes && !isSelectedCluster) {
-      return;
+      continue;
     }
 
-    const isDirectlySelected = node.id === state.selectedNodeId;
-    const isNeighborOfSelected = state.selectedNodeId ? selectedNodeNeighbors.has(node.id) : false;
+    const isDirectlySelected = item.isSelected;
+    const isNeighborOfSelected = state.selectedNodeId !== null && selectedNodeNeighbors.has(node.id);
 
-    // Focused alpha gating:
-    // If a node is selected: focal node = 1.0, 1st-degree citation neighbors = 0.95, others gently dimmed
-    // If a subfield is selected: cluster nodes = 1.0, outside clusters dimmed
     let effectiveAlpha = isPastYear ? 0.16 : 0.85 * lod.nodeAlpha;
-
     if (state.selectedNodeId) {
       if (isDirectlySelected) {
         effectiveAlpha = 1.0;
@@ -450,49 +582,45 @@ export function renderCanvas(
       }
     }
 
-    // Preserve semantic kind colors (papers remain blue, reviews remain gold, authors teal, venues pink)
-    // Only the clicked focal node turns solid accentHi gold!
+    ctx.globalAlpha = effectiveAlpha;
     const nodeColor = isDirectlySelected ? PALETTE.accentHi : getNodeColor(node.kind);
 
-    ctx.save();
-    ctx.globalAlpha = effectiveAlpha;
-
-    // Apply shadow glow strictly to directly selected or hovered node
     if (isHovered || isDirectlySelected) {
       ctx.shadowColor = PALETTE.accentHi;
       ctx.shadowBlur = 14 * camera.scale;
     }
 
     ctx.beginPath();
-    ctx.arc(x, y, size, 0, Math.PI * 2);
+    ctx.arc(x, y, size, 0, twoPi);
     ctx.fillStyle = nodeColor;
     ctx.fill();
 
-    // Focal highlight rings
+    if (isHovered || isDirectlySelected) {
+      ctx.shadowBlur = 0;
+    }
+
     if (isDirectlySelected) {
       ctx.beginPath();
-      ctx.arc(x, y, size + 3.5, 0, Math.PI * 2);
+      ctx.arc(x, y, size + 3.5, 0, twoPi);
       ctx.strokeStyle = PALETTE.accentHi;
-      ctx.lineWidth = 2 / camera.scale;
+      ctx.lineWidth = 2 * invScale;
       ctx.stroke();
     } else if (isNeighborOfSelected) {
       ctx.beginPath();
-      ctx.arc(x, y, size + 2, 0, Math.PI * 2);
+      ctx.arc(x, y, size + 2, 0, twoPi);
       ctx.strokeStyle = 'rgba(230, 210, 154, 0.7)';
-      ctx.lineWidth = 1 / camera.scale;
+      ctx.lineWidth = invScale;
       ctx.stroke();
     }
 
-    // Inner ring for reviews/surveys
     if (node.kind === 'review' && !isDirectlySelected) {
       ctx.beginPath();
-      ctx.arc(x, y, size + 2, 0, Math.PI * 2);
+      ctx.arc(x, y, size + 2, 0, twoPi);
       ctx.strokeStyle = PALETTE.kindReview;
-      ctx.lineWidth = 1 / camera.scale;
+      ctx.lineWidth = invScale;
       ctx.stroke();
     }
 
-    // Author icon badge representation: diamond
     if (node.kind === 'author') {
       ctx.beginPath();
       const d = size * 0.7;
@@ -502,110 +630,115 @@ export function renderCanvas(
       ctx.lineTo(x - d, y);
       ctx.closePath();
       ctx.strokeStyle = PALETTE.kindAuthor;
-      ctx.lineWidth = 1 / camera.scale;
+      ctx.lineWidth = invScale;
       ctx.stroke();
     }
 
-    // LOD 3: Node Label (scale >= 1.8 or when focused)
     if (lod.showLabels || isHovered || isDirectlySelected || isNeighborOfSelected) {
-      ctx.globalAlpha = (isHovered || isDirectlySelected) ? 1.0 : (isNeighborOfSelected ? 0.95 : lod.labelAlpha);
-      ctx.font = `${isDirectlySelected ? '500' : '400'} ${Math.max(8.5, 9 / camera.scale)}px Inter, sans-serif`;
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'middle';
-      ctx.fillStyle = isDirectlySelected ? PALETTE.accentHi : (isNeighborOfSelected ? '#E2E8F0' : PALETTE.textHi);
+      ctx.globalAlpha = isHovered || isDirectlySelected
+        ? 1.0
+        : isNeighborOfSelected
+          ? 0.95
+          : lod.labelAlpha;
 
-      // Truncate long labels for visual cleanliness
+      const desiredFont = isDirectlySelected ? scratch.fontNodeSelected : scratch.fontNodeRegular;
+      if (currentFont !== desiredFont) {
+        ctx.font = desiredFont;
+        currentFont = desiredFont;
+      }
+
+      ctx.fillStyle = isDirectlySelected
+        ? PALETTE.accentHi
+        : isNeighborOfSelected
+          ? '#E2E8F0'
+          : PALETTE.textHi;
+
       const displayLabel = node.label.length > 34 ? `${node.label.slice(0, 32)}...` : node.label;
       ctx.fillText(displayLabel, x + size + 5, y);
 
-      // LOD 4: Citation count tag
       if (lod.showDetails || isHovered || isDirectlySelected) {
+        if (currentFont !== scratch.fontNodeDetail) {
+          ctx.font = scratch.fontNodeDetail;
+          currentFont = scratch.fontNodeDetail;
+        }
         ctx.fillStyle = isDirectlySelected ? '#E6D29A' : PALETTE.textDim;
-        ctx.font = `400 ${Math.max(7.5, 8 / camera.scale)}px Inter, sans-serif`;
-        ctx.fillText(`${node.year} · ${node.weight.toLocaleString()} cites`, x + size + 5, y + 11);
+        const detailText =
+          node.kind === 'author' || node.kind === 'venue'
+            ? `${node.paperCount ?? 0} papers · ${(node.citationSum ?? node.weight).toLocaleString()} cites`
+            : `${node.year} · ${node.weight.toLocaleString()} cites`;
+        ctx.fillText(detailText, x + size + 5, y + 11);
       }
     }
 
-    ctx.restore();
     nodesDrawn++;
-  });
+  }
+
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur = 0;
 
   // 10. Draw Center Root Node & Breathing / 26-Notch Tick Ring
-  const rootItem = nodeRenderMap.get(state.graph.root.id);
+  const rootItem = nodeRenderMap.get(rootNodeId);
   const rootX = rootItem ? rootItem.x : 0;
   const rootY = rootItem ? rootItem.y : 0;
 
-  // Breathing calculation: 1 + sin(t * 1.1) * 0.06
   const breathFactor = 1 + Math.sin(timeSec * 1.1) * 0.06;
   const baseRootRadius = 14;
   const rootRadius = baseRootRadius * breathFactor;
 
-  ctx.save();
-  // Outer 26-notch tick ring around root counter-rotating:
   const tickRadius = 32;
   const tickCount = 26;
-  const tickRotation = -timeSec * 0.35; // Counter-rotating
+  const tickRotation = -timeSec * 0.35;
 
-  ctx.strokeStyle = 'rgba(185, 143, 232, 0.45)';
-  ctx.lineWidth = 1.25 / camera.scale;
-
+  ctx.beginPath();
   for (let i = 0; i < tickCount; i++) {
-    const tickAngle = tickRotation + (i / tickCount) * Math.PI * 2;
+    const tickAngle = tickRotation + (i / tickCount) * twoPi;
     const innerT = tickRadius - 3;
     const outerT = tickRadius + (i % 2 === 0 ? 3 : 1);
-    const x1 = rootX + Math.cos(tickAngle) * innerT;
-    const y1 = rootY + Math.sin(tickAngle) * innerT;
-    const x2 = rootX + Math.cos(tickAngle) * outerT;
-    const y2 = rootY + Math.sin(tickAngle) * outerT;
-
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
+    const cosA = Math.cos(tickAngle);
+    const sinA = Math.sin(tickAngle);
+    ctx.moveTo(rootX + cosA * innerT, rootY + sinA * innerT);
+    ctx.lineTo(rootX + cosA * outerT, rootY + sinA * outerT);
   }
+  ctx.strokeStyle = 'rgba(185, 143, 232, 0.45)';
+  ctx.lineWidth = 1.25 * invScale;
+  ctx.stroke();
 
-  // Root node glow & body (Rule: shadowBlur allowed for root node)
   ctx.shadowColor = PALETTE.rootNode;
   ctx.shadowBlur = 24 * camera.scale;
 
-  // Root body gradient
   const rootFillGrad = ctx.createRadialGradient(rootX, rootY, 0, rootX, rootY, rootRadius);
   rootFillGrad.addColorStop(0, '#E9D5FF');
   rootFillGrad.addColorStop(0.7, PALETTE.rootNode);
   rootFillGrad.addColorStop(1, '#7C3AED');
 
   ctx.beginPath();
-  ctx.arc(rootX, rootY, rootRadius, 0, Math.PI * 2);
+  ctx.arc(rootX, rootY, rootRadius, 0, twoPi);
   ctx.fillStyle = rootFillGrad;
   ctx.fill();
 
-  // Root border
   ctx.shadowBlur = 0;
   ctx.strokeStyle = '#F3E8FF';
-  ctx.lineWidth = 1.5 / camera.scale;
+  ctx.lineWidth = 1.5 * invScale;
   ctx.stroke();
 
-  // Root Label
-  ctx.font = `500 ${Math.max(10, 11 / camera.scale)}px Inter, sans-serif`;
+  ctx.font = scratch.fontRootTitle;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
   ctx.fillStyle = PALETTE.textHi;
   ctx.fillText('Foundation Benchmark', rootX, rootY + rootRadius + 10);
 
-  ctx.font = `400 ${Math.max(8.5, 9 / camera.scale)}px Inter, sans-serif`;
+  ctx.font = scratch.fontRootSub;
   ctx.fillStyle = PALETTE.accentHi;
-  const shortRootTitle = state.graph.root.label.length > 36
-    ? `${state.graph.root.label.slice(0, 34)}...`
-    : state.graph.root.label;
+  const shortRootTitle =
+    state.graph.root.label.length > 36
+      ? `${state.graph.root.label.slice(0, 34)}...`
+      : state.graph.root.label;
   ctx.fillText(shortRootTitle, rootX, rootY + rootRadius + 24);
 
-  ctx.restore();
   nodesDrawn++;
 
-  // Restore world transform
+  // Restore world & DPR transforms
   ctx.restore();
-
-  // Restore DPR transform
   ctx.restore();
 
   const renderTimeMs = performance.now() - startTime;

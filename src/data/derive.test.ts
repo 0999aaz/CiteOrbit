@@ -1,7 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { density, coverage, momentum, calculateGrowth, calculateYearlyBars } from './derive.ts';
-import type { Subfield, GNode } from './schema.ts';
+import {
+  density,
+  coverage,
+  momentum,
+  calculateGrowth,
+  calculateYearlyBars,
+  computeSubfieldStats,
+  computeForecast,
+} from './derive.ts';
+import type { Subfield, GNode, Graph } from './schema.ts';
+import rawGraphData from './graph.json';
 
 const mockSubfield: Subfield = {
   id: 'subfield-1',
@@ -89,4 +98,86 @@ test('calculateYearlyBars produces 18 bars', () => {
   const bars = calculateYearlyBars('subfield-1', 2024, mockNodes);
   assert.equal(bars.length, 18);
   assert.ok(bars.some(b => b > 0));
+});
+
+test('computeSubfieldStats counts deduplicated nodes per kind without synthetic multipliers', () => {
+  const nodesWithEntities: GNode[] = [
+    ...mockNodes,
+    { id: 'R1', kind: 'review', label: 'Survey 2022', year: 2022, weight: 500, subfieldId: 'subfield-1', orbitAngle: 0, orbitRadius: 15, size: 6 },
+    { id: 'A1', kind: 'author', label: 'Alice', year: 2023, weight: 550, citationSum: 550, paperCount: 2, subfieldId: 'subfield-1', orbitAngle: 0, orbitRadius: 75, size: 4.8 },
+    { id: 'V1', kind: 'venue', label: 'Nature', year: 2022, weight: 500, citationSum: 500, paperCount: 1, subfieldId: 'subfield-1', orbitAngle: 0, orbitRadius: 88, size: 5.2 },
+  ];
+
+  const statsAll = computeSubfieldStats('subfield-1', nodesWithEntities);
+  assert.deepEqual(statsAll, [
+    { label: 'Papers', value: 4 },
+    { label: 'Authors', value: 1 },
+    { label: 'Surveys', value: 1 },
+    { label: 'Venues', value: 1 },
+  ]);
+
+  const stats2020 = computeSubfieldStats('subfield-1', nodesWithEntities, 2020);
+  assert.deepEqual(stats2020, [
+    { label: 'Papers', value: 2 },
+    { label: 'Authors', value: 0 },
+    { label: 'Surveys', value: 0 },
+    { label: 'Venues', value: 0 },
+  ]);
+});
+
+test('computeForecast projects 5-year metrics consistently with calculateGrowth', () => {
+  const results = computeForecast([mockSubfield], mockNodes);
+  assert.equal(results.length, 1);
+  assert.equal(results[0].clusterId, 'subfield-1');
+  assert.equal(results[0].growthMultiplier, calculateGrowth('subfield-1', 2026, mockNodes));
+  assert.ok(results[0].projectedNodes >= mockNodes.length);
+});
+
+test('graph.json satisfies P1-3 data honesty invariants (citationSum, paperCount, stats, growth)', () => {
+  const graph = rawGraphData as unknown as Graph;
+  assert.ok(graph.nodes.length >= 700 && graph.nodes.length <= 820);
+
+  for (const node of graph.nodes) {
+    assert.equal(typeof node.citationSum, 'number', `Node ${node.id} missing citationSum`);
+    assert.equal(typeof node.paperCount, 'number', `Node ${node.id} missing paperCount`);
+    if (node.kind === 'author' || node.kind === 'venue') {
+      assert.ok((node.paperCount ?? 0) >= 2, `Entity ${node.id} should have >=2 corpus papers`);
+      assert.equal(node.weight, node.citationSum);
+    }
+  }
+
+  const maxYear = graph.yearRange[1];
+  for (const sf of graph.subfields) {
+    const expectedStats = computeSubfieldStats(sf.id, graph.nodes);
+    assert.deepEqual(sf.stats, expectedStats, `Subfield ${sf.id} stats must match deduplicated graph.nodes`);
+    const expectedGrowth = calculateGrowth(sf.id, maxYear, graph.nodes);
+    assert.equal(sf.growth, expectedGrowth, `Subfield ${sf.id} growth must match calculateGrowth at maxYear`);
+  }
+});
+
+test('derive memoization caches by subfieldId|year and invalidates when nodes reference changes', () => {
+  const barsFirst = calculateYearlyBars('subfield-1', 2024, mockNodes);
+  const barsSecond = calculateYearlyBars('subfield-1', 2024, mockNodes);
+  // Same array reference returned from WeakMap cache
+  assert.equal(barsFirst, barsSecond);
+
+  const covBefore = coverage(mockSubfield, 2020, mockNodes);
+  const nextNodes: GNode[] = [
+    ...mockNodes,
+    {
+      id: 'W4',
+      kind: 'paper',
+      label: 'Paper 2020',
+      year: 2020,
+      weight: 120,
+      subfieldId: 'subfield-1',
+      orbitAngle: 0.5,
+      orbitRadius: 25,
+      size: 4,
+    },
+  ];
+  const covAfter = coverage(mockSubfield, 2020, nextNodes);
+  const barsThird = calculateYearlyBars('subfield-1', 2024, nextNodes);
+  assert.notEqual(barsFirst, barsThird);
+  assert.notEqual(covBefore, covAfter);
 });

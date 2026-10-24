@@ -1,4 +1,3 @@
-import React from 'react';
 import { TopBar } from './components/TopBar.tsx';
 import { TimelineRail } from './components/TimelineRail.tsx';
 import { GraphCanvas } from './canvas/GraphCanvas.tsx';

@@ -1,4 +1,4 @@
-import React, { useRef, useCallback } from 'react';
+import React, { useRef, useCallback, useEffect } from 'react';
 import { useDashboard } from '../store/useDashboard.ts';
 
 const MIN_YEAR = 1995;
@@ -10,22 +10,58 @@ export const TimelineRail: React.FC = () => {
   const setYear = useDashboard(s => s.setYear);
   const railRef = useRef<HTMLDivElement>(null);
   const isDraggingRef = useRef(false);
+  const pendingYearRef = useRef<number>(year);
+  const rafIdRef = useRef<number | null>(null);
 
-  // Compute year from vertical pointer Y
-  const updateYearFromPointer = useCallback((clientY: number) => {
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+      }
+    };
+  }, []);
+
+  const computeYearFromClientY = useCallback((clientY: number): number | null => {
     const rail = railRef.current;
-    if (!rail) return;
+    if (!rail) return null;
 
     const rect = rail.getBoundingClientRect();
     const padding = 20;
-    const trackHeight = rect.height - padding * 2;
+    const trackHeight = Math.max(1, rect.height - padding * 2);
     const clampedY = Math.max(0, Math.min(trackHeight, clientY - rect.top - padding));
 
-    // Top is MAX_YEAR (2026), bottom is MIN_YEAR (1995)
     const ratio = clampedY / trackHeight;
     const targetYear = Math.round(MAX_YEAR - ratio * (MAX_YEAR - MIN_YEAR));
-    setYear(Math.max(MIN_YEAR, Math.min(MAX_YEAR, targetYear)));
-  }, [setYear]);
+    return Math.max(MIN_YEAR, Math.min(MAX_YEAR, targetYear));
+  }, []);
+
+  // Schedule setYear at most once per animation frame during rapid scrubbing
+  const scheduleYearUpdate = useCallback((clientY: number, immediate: boolean = false) => {
+    const nextYear = computeYearFromClientY(clientY);
+    if (nextYear === null) return;
+
+    pendingYearRef.current = nextYear;
+
+    if (immediate) {
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      if (useDashboard.getState().year !== nextYear) {
+        setYear(nextYear);
+      }
+      return;
+    }
+
+    if (rafIdRef.current !== null) return;
+    rafIdRef.current = requestAnimationFrame(() => {
+      rafIdRef.current = null;
+      const target = pendingYearRef.current;
+      if (useDashboard.getState().year !== target) {
+        setYear(target);
+      }
+    });
+  }, [computeYearFromClientY, setYear]);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     const rail = railRef.current;
@@ -33,18 +69,21 @@ export const TimelineRail: React.FC = () => {
 
     rail.setPointerCapture(e.pointerId);
     isDraggingRef.current = true;
-    updateYearFromPointer(e.clientY);
+    scheduleYearUpdate(e.clientY, true);
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!isDraggingRef.current) return;
-    updateYearFromPointer(e.clientY);
+    scheduleYearUpdate(e.clientY, false);
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     const rail = railRef.current;
     if (rail && rail.hasPointerCapture(e.pointerId)) {
       rail.releasePointerCapture(e.pointerId);
+    }
+    if (isDraggingRef.current) {
+      scheduleYearUpdate(e.clientY, true);
     }
     isDraggingRef.current = false;
   };
@@ -55,6 +94,7 @@ export const TimelineRail: React.FC = () => {
   return (
     <aside
       ref={railRef}
+      aria-label="Publication year timeline (1995 to 2026)"
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
@@ -75,7 +115,8 @@ export const TimelineRail: React.FC = () => {
       {/* Major Tick Labels */}
       {MAJOR_TICKS.map(tick => {
         const tickPercent = ((MAX_YEAR - tick) / (MAX_YEAR - MIN_YEAR)) * 100;
-        const isCurrent = Math.abs(year - tick) < 2;
+        const isOverlappedByThumb = Math.abs(year - tick) <= 1;
+        const isNearCurrent = Math.abs(year - tick) === 2;
 
         return (
           <div
@@ -86,15 +127,19 @@ export const TimelineRail: React.FC = () => {
             }}
           >
             <span
-              className={`text-[8.5px] tabular-nums tracking-tighter ${
-                isCurrent ? 'text-[#E6D29A] font-medium' : 'text-[#4E6069]'
+              className={`text-[8.5px] tabular-nums tracking-tighter transition-opacity duration-75 ${
+                isOverlappedByThumb
+                  ? 'opacity-0'
+                  : isNearCurrent
+                  ? 'text-[#E6D29A] font-medium'
+                  : 'text-[#4E6069]'
               }`}
             >
               {tick}
             </span>
             <div
               className={`w-1.5 h-[1px] ${
-                isCurrent ? 'bg-[#E6D29A] w-2.5' : 'bg-[rgba(255,255,255,0.15)]'
+                isOverlappedByThumb || isNearCurrent ? 'bg-[#E6D29A] w-2.5' : 'bg-[rgba(255,255,255,0.15)]'
               }`}
             />
           </div>

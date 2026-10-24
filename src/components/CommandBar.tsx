@@ -2,17 +2,24 @@ import React, { useState } from 'react';
 import { useDashboard } from '../store/useDashboard.ts';
 import type { Graph } from '../data/schema.ts';
 import rawGraphData from '../data/graph.json';
-import { calculateGrowth, coverage } from '../data/derive.ts';
+import {
+  executeGraphQuery,
+  type QueryExecutionResult,
+  type QueryFilterType,
+  type QueryScope,
+} from '../data/query.ts';
 
 const graph = rawGraphData as unknown as Graph;
 
 export const CommandBar: React.FC = () => {
   const [query, setQuery] = useState('');
-  const [scope, setScope] = useState<'cluster' | 'global'>('cluster');
-  const [filterType, setFilterType] = useState<'all' | 'milestone'>('all');
-  const [activeResponse, setActiveResponse] = useState<string | null>(null);
+  const [scope, setScope] = useState<QueryScope>('cluster');
+  const [filterType, setFilterType] = useState<QueryFilterType>('all');
+  const [activeResult, setActiveResult] = useState<QueryExecutionResult | null>(null);
 
   const selectedSubfieldId = useDashboard(s => s.selectedSubfieldId);
+  const setSelectedSubfieldId = useDashboard(s => s.setSelectedSubfieldId);
+  const setSelectedNodeId = useDashboard(s => s.setSelectedNodeId);
   const year = useDashboard(s => s.year);
   const addQARecord = useDashboard(s => s.addQARecord);
 
@@ -23,38 +30,92 @@ export const CommandBar: React.FC = () => {
     const trimmed = query.trim();
     if (!trimmed) return;
 
-    const g = calculateGrowth(activeSubfield.id, year, graph.nodes);
-    const cov = coverage(activeSubfield, year, graph.nodes);
+    const result = executeGraphQuery({
+      rawQuery: trimmed,
+      scope,
+      filterType,
+      activeSubfield,
+      activeYear: year,
+      nodes: graph.nodes,
+      subfields: graph.subfields,
+    });
 
-    let answer = `Q: ${trimmed} → ${activeSubfield.name} (${year} benchmark, coverage ${cov}%): ${activeSubfield.aiAnalysis} Current growth momentum registers at ${g}x.`;
-
-    setActiveResponse(answer);
+    setActiveResult(result);
     addQARecord({
       question: trimmed,
-      answer,
+      answer: result.summaryText,
       timestamp: Date.now(),
     });
     setQuery('');
   };
 
+  const handleFocusPaper = (nodeId: string, subfieldId: string) => {
+    setSelectedNodeId(nodeId);
+    if (subfieldId && subfieldId !== 'root') {
+      setSelectedSubfieldId(subfieldId);
+    }
+  };
+
   return (
-    <div className="relative border-t border-[rgba(255,255,255,0.07)] bg-[#030607] px-4 py-2 select-none z-30">
-      {/* Active Response Toast */}
-      {activeResponse && (
-        <div className="absolute bottom-[52px] left-4 right-4 bg-[#0A1417]/95 border border-[rgba(255,255,255,0.12)] p-2.5 rounded-[7px] shadow-2xl backdrop-blur-md flex items-start justify-between">
-          <div className="text-[11px] text-[#E6D29A] leading-relaxed">
-            {activeResponse}
+    <div className="relative h-[46px] min-h-[46px] border-t border-[rgba(255,255,255,0.07)] bg-[#030607] px-4 flex items-center select-none z-30">
+      {/* Structured Query Result Popover */}
+      {activeResult && (
+        <div
+          role="region"
+          aria-label="Citation query results"
+          className="absolute bottom-[52px] left-4 right-4 bg-[#0A1417]/95 border border-[rgba(255,255,255,0.12)] p-3 rounded-[7px] shadow-2xl backdrop-blur-md"
+        >
+          <div className="flex items-center justify-between gap-2 mb-2">
+            <div className="flex items-center flex-wrap gap-1.5 text-[9.5px]">
+              <span className="px-1.5 py-0.5 rounded-[4px] bg-[rgba(230,210,154,0.12)] border border-[rgba(230,210,154,0.28)] text-[#E6D29A] font-medium">
+                {activeResult.isFallback ? '0 direct matches · Fallback Top 3' : `${activeResult.totalMatched} matched`}
+              </span>
+              <span className="px-1.5 py-0.5 rounded-[4px] bg-[rgba(255,255,255,0.04)] border border-[rgba(255,255,255,0.08)] text-[#DDDFE0]">
+                Scope: {activeResult.scopeLabel}
+              </span>
+              <span className="px-1.5 py-0.5 rounded-[4px] bg-[rgba(255,255,255,0.04)] border border-[rgba(255,255,255,0.08)] text-[#7B848B]">
+                {activeResult.parsed.yearLabel} · {activeResult.filterLabel}
+              </span>
+              <span className="text-[#4E6069] truncate max-w-[260px]">
+                Query: "{activeResult.parsed.raw}"
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setActiveResult(null)}
+              aria-label="Dismiss query results"
+              className="text-[9.5px] text-[#7B848B] hover:text-[#DDDFE0] shrink-0"
+            >
+              Dismiss
+            </button>
           </div>
-          <button
-            onClick={() => setActiveResponse(null)}
-            className="text-[9.5px] text-[#7B848B] hover:text-[#DDDFE0] ml-3"
-          >
-            Dismiss
-          </button>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+            {activeResult.items.map((item, idx) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => handleFocusPaper(item.id, item.subfieldId)}
+                className="text-left p-2 rounded-[7px] border border-[rgba(255,255,255,0.07)] bg-[rgba(255,255,255,0.02)] hover:bg-[rgba(255,255,255,0.05)] hover:border-[rgba(230,210,154,0.3)] transition-colors"
+              >
+                <div className="flex items-center justify-between text-[8.5px] text-[#7B848B] mb-0.5 tabular-nums">
+                  <span className="truncate max-w-[160px] text-[#8FB6D8]">
+                    #{idx + 1} · {item.subfieldName}
+                  </span>
+                  <span className="text-[#E6D29A] font-medium shrink-0 ml-1">
+                    {item.year} · {item.citations.toLocaleString()} cites
+                  </span>
+                </div>
+                <div className="text-[10.5px] text-[#DDDFE0] font-medium leading-snug line-clamp-2">
+                  {item.title}
+                </div>
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
-      <form onSubmit={handleSend} className="h-[34px] flex items-center justify-between gap-3">
+      <form onSubmit={handleSend} className="w-full h-[32px] flex items-center justify-between gap-3">
         {/* Capsule Input Field */}
         <div className="flex-1 h-full flex items-center bg-[rgba(255,255,255,0.02)] border border-[rgba(255,255,255,0.08)] rounded-[20px] px-3 focus-within:border-[rgba(255,255,255,0.2)] focus-within:bg-[rgba(255,255,255,0.03)] transition-all">
           <svg className="w-3.5 h-3.5 text-[#7B848B] mr-2 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
@@ -65,7 +126,8 @@ export const CommandBar: React.FC = () => {
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Ask about this subfield..."
+            aria-label="Search papers in subfield or global atlas"
+            placeholder="Query literature (e.g. segmentation since 2020, transformer 2021)..."
             className="w-full bg-transparent text-[11px] text-[#DDDFE0] placeholder-[#4E6069] focus:outline-none"
           />
         </div>
@@ -74,6 +136,7 @@ export const CommandBar: React.FC = () => {
         <button
           type="button"
           onClick={() => setScope(s => s === 'cluster' ? 'global' : 'cluster')}
+          aria-label={`Search scope: ${scope === 'cluster' ? 'Cluster scope' : 'Global atlas'}`}
           className={`h-full px-2.5 rounded-[20px] border text-[9.5px] transition-colors shrink-0 ${
             scope === 'cluster'
               ? 'bg-[rgba(255,255,255,0.06)] border-[rgba(255,255,255,0.15)] text-[#E6D29A]'
@@ -87,6 +150,7 @@ export const CommandBar: React.FC = () => {
         <button
           type="button"
           onClick={() => setFilterType(f => f === 'all' ? 'milestone' : 'all')}
+          aria-label={`Citation filter: ${filterType === 'milestone' ? 'Milestones only' : 'All citations'}`}
           className={`h-full px-2.5 rounded-[20px] border text-[9.5px] transition-colors shrink-0 ${
             filterType === 'milestone'
               ? 'bg-[rgba(255,255,255,0.06)] border-[rgba(255,255,255,0.15)] text-[#E6D29A]'
@@ -100,6 +164,7 @@ export const CommandBar: React.FC = () => {
         <button
           type="submit"
           disabled={!query.trim()}
+          aria-label="Run citation query"
           className="h-full px-3.5 rounded-[20px] bg-[#E6D29A] text-[#030607] font-medium text-[11px] hover:bg-[#F2DFAC] disabled:opacity-30 disabled:hover:bg-[#E6D29A] transition-all flex items-center justify-center shrink-0"
         >
           <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">

@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useMemo } from 'react';
 import type { Graph } from '../data/schema.ts';
 import rawGraphData from '../data/graph.json';
 import { coverage, momentum } from '../data/derive.ts';
@@ -10,9 +10,33 @@ export const RadarWidget: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const year = useDashboard(s => s.year);
   const selectedSubfieldId = useDashboard(s => s.selectedSubfieldId);
-  const setSelectedSubfieldId = useDashboard(s => s.setSelectedSubfieldId);
 
-  const currentMomentum = momentum(graph.subfields, year, graph.nodes);
+  const currentMomentum = useMemo(() => momentum(graph.subfields, year, graph.nodes), [year]);
+
+  // Precompute polygon vertices once per (year, selectedSubfieldId) rather than 60x/sec
+  const polygonVertices = useMemo(() => {
+    const size = 176;
+    const cx = size / 2;
+    const cy = size / 2;
+    const maxR = size * 0.38;
+    const subfields = graph.subfields;
+    const numAxes = subfields.length || 1;
+
+    return subfields.map((sf, idx) => {
+      const cov = coverage(sf, year, graph.nodes);
+      const radius = (cov / 100) * maxR;
+      const angle = (idx / numAxes) * Math.PI * 2 - Math.PI / 2;
+      return {
+        x: cx + Math.cos(angle) * radius,
+        y: cy + Math.sin(angle) * radius,
+        id: sf.id,
+        isSelected: sf.id === selectedSubfieldId,
+      };
+    });
+  }, [year, selectedSubfieldId]);
+
+  const polygonVerticesRef = useRef(polygonVertices);
+  polygonVerticesRef.current = polygonVertices;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -30,42 +54,39 @@ export const RadarWidget: React.FC = () => {
     canvas.style.height = `${size}px`;
 
     const subfields = graph.subfields;
-    const numAxes = subfields.length;
+    const numAxes = subfields.length || 1;
     const cx = size / 2;
     const cy = size / 2;
     const maxR = size * 0.38;
+    const rings = [0.33, 0.66, 1.0];
 
     const renderRadar = (timeMs: number) => {
       const timeSec = timeMs / 1000;
-      ctx.save();
-      ctx.scale(dpr, dpr);
+      const vertices = polygonVerticesRef.current;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, size, size);
 
       // Concentric grid rings
-      const rings = [0.33, 0.66, 1.0];
-      rings.forEach(rFrac => {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < rings.length; i++) {
         ctx.beginPath();
-        ctx.arc(cx, cy, maxR * rFrac, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
-        ctx.lineWidth = 1;
+        ctx.arc(cx, cy, maxR * rings[i], 0, Math.PI * 2);
         ctx.stroke();
-      });
+      }
 
-      // Axis spokes
-      subfields.forEach((_, idx) => {
+      // Axis spokes (single compound path)
+      ctx.beginPath();
+      for (let idx = 0; idx < numAxes; idx++) {
         const angle = (idx / numAxes) * Math.PI * 2 - Math.PI / 2;
-        const ax = cx + Math.cos(angle) * maxR;
-        const ay = cy + Math.sin(angle) * maxR;
-        ctx.beginPath();
         ctx.moveTo(cx, cy);
-        ctx.lineTo(ax, ay);
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
-        ctx.stroke();
-      });
+        ctx.lineTo(cx + Math.cos(angle) * maxR, cy + Math.sin(angle) * maxR);
+      }
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
+      ctx.stroke();
 
       // 0.9 rad/s sweep line
       const sweepAngle = (timeSec * 0.9) % (Math.PI * 2);
-      ctx.save();
       ctx.beginPath();
       ctx.moveTo(cx, cy);
       ctx.arc(cx, cy, maxR, sweepAngle - 0.3, sweepAngle, false);
@@ -82,57 +103,43 @@ export const RadarWidget: React.FC = () => {
       ctx.strokeStyle = 'rgba(230, 210, 154, 0.35)';
       ctx.lineWidth = 1;
       ctx.stroke();
-      ctx.restore();
 
       // Coverage polygon
-      ctx.beginPath();
-      const polygonPoints: Array<{ x: number; y: number; id: string }> = [];
-
-      subfields.forEach((sf, idx) => {
-        const cov = coverage(sf, year, graph.nodes);
-        const radius = (cov / 100) * maxR;
-        const angle = (idx / numAxes) * Math.PI * 2 - Math.PI / 2;
-        const px = cx + Math.cos(angle) * radius;
-        const py = cy + Math.sin(angle) * radius;
-        polygonPoints.push({ x: px, y: py, id: sf.id });
-
-        if (idx === 0) {
-          ctx.moveTo(px, py);
-        } else {
-          ctx.lineTo(px, py);
-        }
-      });
-      ctx.closePath();
-
-      // Polygon fill & stroke
-      ctx.fillStyle = 'rgba(143, 182, 216, 0.16)';
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(143, 182, 216, 0.65)';
-      ctx.lineWidth = 1.25;
-      ctx.stroke();
-
-      // Polygon vertices
-      polygonPoints.forEach(p => {
-        const isSel = p.id === selectedSubfieldId;
+      if (vertices.length > 0) {
         ctx.beginPath();
-        ctx.arc(p.x, p.y, isSel ? 3.5 : 2, 0, Math.PI * 2);
-        ctx.fillStyle = isSel ? '#E6D29A' : '#8FB6D8';
-        ctx.fill();
-        if (isSel) {
-          ctx.strokeStyle = '#FFFFFF';
-          ctx.lineWidth = 1;
-          ctx.stroke();
+        ctx.moveTo(vertices[0].x, vertices[0].y);
+        for (let i = 1; i < vertices.length; i++) {
+          ctx.lineTo(vertices[i].x, vertices[i].y);
         }
-      });
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(143, 182, 216, 0.16)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(143, 182, 216, 0.65)';
+        ctx.lineWidth = 1.25;
+        ctx.stroke();
 
-      ctx.restore();
+        // Polygon vertices
+        for (let i = 0; i < vertices.length; i++) {
+          const p = vertices[i];
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.isSelected ? 3.5 : 2, 0, Math.PI * 2);
+          ctx.fillStyle = p.isSelected ? '#E6D29A' : '#8FB6D8';
+          ctx.fill();
+          if (p.isSelected) {
+            ctx.strokeStyle = '#FFFFFF';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+          }
+        }
+      }
+
       animId = requestAnimationFrame(renderRadar);
     };
 
     animId = requestAnimationFrame(renderRadar);
 
     return () => cancelAnimationFrame(animId);
-  }, [year, selectedSubfieldId]);
+  }, []);
 
   return (
     <div className="flex flex-col items-center p-2.5 rounded-[7px] border border-[rgba(255,255,255,0.07)] bg-[rgba(255,255,255,0.015)]">

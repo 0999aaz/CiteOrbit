@@ -8,10 +8,8 @@ export function useAnimationFrame(callback: (timeSec: number, deltaTimeMs: numbe
 
   useEffect(() => {
     const animate = (time: number) => {
-      if (previousTimeRef.current !== null) {
-        const deltaTimeMs = time - previousTimeRef.current;
-        callbackRef.current(time / 1000, deltaTimeMs);
-      }
+      const deltaTimeMs = previousTimeRef.current !== null ? time - previousTimeRef.current : 16.67;
+      callbackRef.current(time / 1000, deltaTimeMs);
       previousTimeRef.current = time;
       requestRef.current = requestAnimationFrame(animate);
     };

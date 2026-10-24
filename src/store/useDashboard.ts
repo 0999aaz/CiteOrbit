@@ -35,7 +35,6 @@ interface DashboardState {
 
   // Modes
   isForecasting: boolean;
-  activeFilter: 'peer_reviewed' | 'all';
 
   // AI Command History
   qaHistory: QARecord[];
@@ -53,7 +52,6 @@ interface DashboardState {
   setCamera: (camera: CameraState | ((prev: CameraState) => CameraState)) => void;
   resetCamera: () => void;
   toggleForecast: () => void;
-  setActiveFilter: (filter: 'peer_reviewed' | 'all') => void;
   addQARecord: (record: QARecord) => void;
 }
 
@@ -73,7 +71,6 @@ export const useDashboard = create<DashboardState>((set) => ({
   camera: { ...DEFAULT_CAMERA },
 
   isForecasting: false,
-  activeFilter: 'all',
 
   qaHistory: [],
 
@@ -95,6 +92,5 @@ export const useDashboard = create<DashboardState>((set) => ({
     })),
   resetCamera: () => set({ camera: { ...DEFAULT_CAMERA } }),
   toggleForecast: () => set((state) => ({ isForecasting: !state.isForecasting })),
-  setActiveFilter: (filter) => set({ activeFilter: filter }),
   addQARecord: (record) => set((state) => ({ qaHistory: [record, ...state.qaHistory] })),
 }));

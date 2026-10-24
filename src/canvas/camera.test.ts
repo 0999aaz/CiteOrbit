@@ -48,3 +48,26 @@ test('zoom clamps within [0.4, 4.0]', () => {
   const zoomedIn = zoomAtPoint({ x: 0, y: 0, scale: 3.5 }, 2.0, 350, 245, originX, originY);
   assert.equal(zoomedIn.scale, 4.0);
 });
+
+test('continuous zoom from 1.0x to 3.0x preserves cursor world anchor within < 0.5px drift', () => {
+  const originX = 487.2; // 1160 * 0.42
+  const originY = 437.4; // 810 * 0.54
+  const cursorScreenX = 762;
+  const cursorScreenY = 288;
+
+  let cam = { ...DEFAULT_CAMERA };
+  const initialWorldAnchor = screenToWorld(cursorScreenX, cursorScreenY, originX, originY, cam);
+
+  // Step through wheel zoom ticks (1.12x) until reaching >= 3.0x, then exact factor to 3.0x
+  while (cam.scale < 3.0) {
+    const nextFactor = cam.scale * 1.12 > 3.0 ? 3.0 / cam.scale : 1.12;
+    cam = zoomAtPoint(cam, nextFactor, cursorScreenX, cursorScreenY, originX, originY);
+
+    const projectedScreen = worldToScreen(initialWorldAnchor.x, initialWorldAnchor.y, originX, originY, cam);
+    const driftPx = Math.hypot(projectedScreen.x - cursorScreenX, projectedScreen.y - cursorScreenY);
+    assert.ok(driftPx < 0.5, `Expected cursor anchor drift < 0.5px at scale ${cam.scale}, got ${driftPx}px`);
+  }
+
+  assert.ok(Math.abs(cam.scale - 3.0) < 1e-6);
+});
+

@@ -1,5 +1,5 @@
 import React from 'react';
-import { useDashboard, type ToolMode } from '../store/useDashboard.ts';
+import { useDashboard } from '../store/useDashboard.ts';
 
 export const TopBar: React.FC = () => {
   const activeTool = useDashboard(s => s.activeTool);
@@ -118,9 +118,12 @@ export const TopBar: React.FC = () => {
           <span>{isForecasting ? 'Forecasting 2031' : 'Forecast'}</span>
         </button>
 
-        {/* Minimalist Avatar */}
-        <div className="w-6 h-6 rounded-full border border-[rgba(255,255,255,0.12)] bg-[rgba(255,255,255,0.04)] flex items-center justify-center text-[9.5px] text-[#A6A6A6]">
-          AI
+        {/* OpenAlex Snapshot Corpus Badge */}
+        <div
+          title="OpenAlex offline snapshot corpus"
+          className="w-6 h-6 rounded-full border border-[rgba(255,255,255,0.12)] bg-[rgba(255,255,255,0.04)] flex items-center justify-center text-[9px] text-[#A6A6A6]"
+        >
+          OA
         </div>
       </div>
     </header>

@@ -2,7 +2,7 @@
 
 > **Target Role:** Design Engineer / Senior Frontend (Data Visualization & Creative Engineering)  
 > **Core Artifact:** Polar Academic Citation Intelligence Engine  
-> **Live Benchmark:** 779 Real Nodes · 3,630 Citation Edges · Constant 60 FPS Canvas 2D  
+> **Live Benchmark:** 778 Real Nodes · 3,612 Citation Edges · 2.20 ms p50 Frame Render Time (Canvas 2D)  
 
 ---
 
@@ -27,10 +27,10 @@ The design references government policy dashboards and high-density financial te
 In early prototypes, standard SVG/DOM node approaches (such as D3 force graphs or React Flow) experienced severe frame drops:
 - At 200 DOM elements with SVG drop-shadows: **24 FPS**, with massive garbage collection spikes due to continuous DOM style reconciliations.
 - In **Paper Atlas**, we engineered a pure functional Canvas 2D renderer (`renderer.ts`). The render loop does **not** import React and does **not** read from any state store.
-- **Profiling Result:**
-  - Full render pass across 779 nodes and 3,630 bezier curves: **3.2 ms ~ 4.8 ms per frame**.
-  - Headroom remaining in 16.67ms frame budget: **~72% idle headroom**.
-  - Frame rate: **Locked 60 FPS** on standard display refresh rates.
+- **Profiling Result (300-Frame Benchmark @ 1440×900, 778 nodes + 3,612 edges):**
+  - Compound Bezier path batching (`≤ 6` `ctx.stroke()` calls per frame) + reusable `RenderScratch` Map buffers reduced rAF render pass time from `7.00 ms` p50 (`11.30 ms` p95) down to **`2.20 ms` p50 / `2.55 ms` mean / `4.00 ms` p95**.
+  - Headroom remaining in a 16.67ms 60Hz frame budget: **>75% idle headroom**.
+  - Camera pan/zoom updates run via imperative refs (`cameraRef` + DOM `zoomHudRef`) with zero React component re-renders per pointer event.
 
 ### 2.2 The ShadowBlur Budget Discipline
 
@@ -74,12 +74,11 @@ $$C_y' = s_y - O_y - w_y \cdot S_{new}$$
 
 This guarantees that pixels directly under the cursor never shift during wheel operations.
 
-### 3.2 Scale-Invariant Hit Testing
+### 3.2 Scale-Invariant Animated Hit Testing
 
-Because world coordinates contract as zoom increases, naive distance checks fail at high magnifications.
-In `hitTest.ts`, tolerance is inversely scaled:
+Because nodes orbit with subtle sinusoidal wobble and expand (`1.18×` cluster radius, `1.12×` intra-cluster orbit) upon selection, `renderer.ts` and `hitTest.ts` share a single pure coordinate generator (`src/layout/positions.ts`) evaluated at `lastFrameTimeRef.current`. Tolerance is inversely scaled:
 $$\text{Tolerance}_{world} = \frac{18\text{px}}{S_{camera}}$$
-This ensures the interactive hit target remains an ergonomically stable 18 screen pixels regardless of zoom depth ($0.4\times$ to $4.0\times$).
+This guarantees exact visual-to-pointer parity across all zoom depths ($0.4\times$ to $4.0\times$) regardless of elapsed animation time.
 
 ### 3.3 Quadratic Bezier Perpendicular Offset
 
@@ -104,8 +103,8 @@ From an initial pool of 6,000 fetched works across 30 pagination batches:
 $$\text{Score}(w) = 3 \cdot \text{inDegree}(w) + \ln(1 + \text{cited\_by\_count}(w))$$
 - **Rationale:** `inDegree` favors topological cohesion within the specific subject corpus, while $\ln(1 + \text{citations})$ preserves universally acknowledged milestone works (e.g., Hinton et al., Nature 2015 with 83k citations) without allowing outliers to monopolize node ranks.
 
-### 4.2 Derived Purity
-All operational indicators (density, coverage, growth rate, and field momentum) are derived on demand via pure functions in `src/data/derive.ts`. No raw `baseCoverage` values are ever exposed directly to the UI, completely eliminating synchronization bugs when scrubbing the timeline.
+### 4.2 Derived Purity & Metric Transparency
+Operational indicators (`density`, composite `Coverage index`, 3-year `calculateGrowth`, structural citation gaps, and heuristic 5-year projections) are derived via pure WeakMap-memoized functions in `src/data/derive.ts` and `src/data/gaps.ts`. Raw `baseCoverage` is never read directly in UI components, author/venue counts reflect exact deduplicated `graph.nodes` tallies, and statistical template summaries are explicitly labeled to distinguish deterministic bibliometric reporting from optional offline LLM synthesis.
 
 ---
 

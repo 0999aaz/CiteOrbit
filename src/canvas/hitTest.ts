@@ -1,10 +1,11 @@
 /**
- * Hit testing with screen-to-world inverse projection.
+ * Hit testing with screen-to-world inverse projection against animated world positions.
  * Screen tolerance is divided by scale to ensure consistent interaction across all zoom levels.
  */
 import type { CameraState } from './camera.ts';
 import { screenToWorld } from './camera.ts';
-import type { GNode, Subfield } from '../data/schema.ts';
+import type { GNode } from '../data/schema.ts';
+import type { ClusterAnchor, WorldPoint } from '../layout/positions.ts';
 
 export interface HitResult {
   hitType: 'node' | 'subfield' | 'none';
@@ -14,9 +15,8 @@ export interface HitResult {
 }
 
 /**
- * Hit test for mouse pointer interaction
- * Why not a spatial quadtree: 800 nodes linear distance check takes < 0.25ms in V8;
- * maintaining a quadtree during cluster float and animations would add unnecessary overhead.
+ * Hit test for mouse pointer interaction using the exact animated coordinates
+ * from the most recently rendered frame.
  */
 export function hitTest(
   screenX: number,
@@ -24,10 +24,9 @@ export function hitTest(
   originX: number,
   originY: number,
   camera: CameraState,
-  nodes: GNode[],
-  subfieldPositions: Map<string, { x: number; y: number; angle: number; radius: number }>,
-  subfields: Subfield[],
-  activeYear: number
+  nodes: readonly GNode[],
+  nodePositions: ReadonlyMap<string, WorldPoint>,
+  clusterAnchors: ReadonlyMap<string, ClusterAnchor>
 ): HitResult {
   const world = screenToWorld(screenX, screenY, originX, originY, camera);
   const baseTolerance = 18 / camera.scale;
@@ -35,16 +34,16 @@ export function hitTest(
   let closestNode: GNode | null = null;
   let minNodeDist = Infinity;
 
-  // 1. Check nodes (prioritizing visible active nodes)
+  // 1. Check nodes using animated world coordinates
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
-    if (node.x === undefined || node.y === undefined) continue;
+    const pos = nodePositions.get(node.id);
+    if (!pos) continue;
 
-    const dx = world.x - node.x;
-    const dy = world.y - node.y;
+    const dx = world.x - pos.x;
+    const dy = world.y - pos.y;
     const dist = Math.hypot(dx, dy);
 
-    // Expand clickable radius with scale-invariant screen tolerance
     const threshold = node.size + baseTolerance;
     if (dist <= threshold && dist < minNodeDist) {
       minNodeDist = dist;
@@ -61,14 +60,14 @@ export function hitTest(
     };
   }
 
-  // 2. Check cluster centers
+  // 2. Check animated cluster centers
   let closestClusterId: string | null = null;
   let minClusterDist = Infinity;
   const clusterTolerance = 52 / camera.scale;
 
-  for (const [sfId, pos] of subfieldPositions.entries()) {
-    const dx = world.x - pos.x;
-    const dy = world.y - pos.y;
+  for (const [sfId, anchor] of clusterAnchors.entries()) {
+    const dx = world.x - anchor.x;
+    const dy = world.y - anchor.y;
     const dist = Math.hypot(dx, dy);
 
     if (dist <= clusterTolerance && dist < minClusterDist) {

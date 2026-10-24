@@ -1,36 +1,45 @@
-import { useEffect, useState, type RefObject } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
 
 export interface Size {
   width: number;
   height: number;
 }
 
-export function useResizeObserver(elementRef: RefObject<HTMLElement | null>): Size {
+export function useResizeObserver(
+  elementRef: RefObject<HTMLElement | null>,
+  onResize?: (size: Size) => void
+): Size {
   const [size, setSize] = useState<Size>({ width: 0, height: 0 });
+  const onResizeRef = useRef(onResize);
+  onResizeRef.current = onResize;
 
   useEffect(() => {
     const el = elementRef.current;
     if (!el) return;
 
-    // Initial size
+    const notify = (rawWidth: number, rawHeight: number) => {
+      const next: Size = {
+        width: Math.round(rawWidth),
+        height: Math.round(rawHeight),
+      };
+      if (onResizeRef.current) {
+        onResizeRef.current(next);
+      } else {
+        setSize(next);
+      }
+    };
+
     const rect = el.getBoundingClientRect();
-    setSize({ width: Math.round(rect.width), height: Math.round(rect.height) });
+    notify(rect.width, rect.height);
 
     const observer = new ResizeObserver((entries) => {
-      if (!entries || entries.length === 0) return;
-      const entry = entries[0];
-      const { width, height } = entry.contentRect;
-      setSize({
-        width: Math.round(width),
-        height: Math.round(height),
-      });
+      for (const entry of entries) {
+        notify(entry.contentRect.width, entry.contentRect.height);
+      }
     });
 
     observer.observe(el);
-
-    return () => {
-      observer.disconnect();
-    };
+    return () => observer.disconnect();
   }, [elementRef]);
 
   return size;
